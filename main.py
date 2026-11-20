@@ -26,6 +26,8 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "dataset" / "CNR-EXT_FULL_IMAGE_1000x750" / "FULL_IMAGE_1000x750"
 MODEL_PATH = PROJECT_DIR / "models" / "parking_classifier.pth"
 CONTEXT_PATH = PROJECT_DIR / "models" / "slot_context.pth"
+GEOMETRY_PATH = PROJECT_DIR / "models" / "slot_geometry.pth"
+BLEND_GNN_WEIGHT = 0.5  # Selected on the official validation split.
 
 # Location of the trained MobileNetV2 checkpoint.
 OUTPUT_DIR = PROJECT_DIR / "output"
@@ -194,7 +196,9 @@ def extract_frame_slots(image, csv_path):
     return torch.stack(crops), valid_spaces
 
 
-def detect_parking(image_path, csv_path, context_checkpoint=None, show=True):
+def detect_parking(image_path, csv_path, context_checkpoint=None, show=True, *, blend=False):
+    if blend:
+        context_checkpoint = CONTEXT_PATH
     # Load the full parking lot image in OpenCV's BGR format.
     image = cv2.imread(str(image_path))
 
@@ -214,6 +218,8 @@ def detect_parking(image_path, csv_path, context_checkpoint=None, show=True):
         from slot_context import load_context, slot_geometry
 
         context = load_context(context_checkpoint, MODEL_PATH, device)
+        if blend:
+            geometry_head = load_context(GEOMETRY_PATH, MODEL_PATH, device)
         geometry = slot_geometry(valid_spaces, image.shape).to(device)
 
     # Disable gradient tracking because we are only making predictions.
@@ -221,6 +227,9 @@ def detect_parking(image_path, csv_path, context_checkpoint=None, show=True):
         if context_checkpoint is not None:
             features, baseline = context.encode(model, batch)
             outputs = context(features, baseline, geometry)
+            if blend:
+                own_slot = geometry_head(features, baseline, geometry)
+                outputs = torch.lerp(own_slot, outputs, BLEND_GNN_WEIGHT)
         else:
             outputs = model(batch)
         # Convert raw classification scores into probabilities.
@@ -333,7 +342,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=Path)
     parser.add_argument("--camera-csv", type=Path)
-    parser.add_argument("--context", type=Path, default=CONTEXT_PATH, help="Trained slot-context checkpoint")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--context", type=Path, default=CONTEXT_PATH, help="Trained slot-context checkpoint")
+    mode.add_argument("--blend", action="store_true", help="Use the validated 50/50 geometry/GNN blend")
     parser.add_argument("--no-display", action="store_true")
     args = parser.parse_args()
     if (args.image is None) != (args.camera_csv is None):
@@ -345,4 +356,5 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Image not found: {args.image}")
         args.camera_csv = DATA_DIR.parent / "camera1.csv"
 
-    detect_parking(args.image, args.camera_csv, args.context, not args.no_display)
+    detect_parking(args.image, args.camera_csv, args.context, not args.no_display,
+                   blend=args.blend)

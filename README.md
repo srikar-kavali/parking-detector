@@ -26,6 +26,8 @@ parking-detector/
 ├── slot_context.py              # Define the GNN and load its checkpoint
 ├── train_context.py             # Train or evaluate the refinement models
 ├── evaluate.py                  # Evaluate MobileNetV2 on pre-cropped images
+├── evaluate_report.py           # Reproduce the held-out weather report
+├── evaluate_blend.py            # Validate and test a geometry/GNN score blend
 ├── models/
 │   ├── parking_classifier.pth   # Matching MobileNetV2 baseline
 │   ├── slot_context.pth         # GNN refinement
@@ -60,11 +62,17 @@ Each refinement checkpoint verifies the exact MobileNetV2 file it was trained
 against. If you have `parking_classifier_fast.pth`, it is a separate baseline
 experiment.
 
-## Run the image demo
+## Run the bundled demo
 
-```powershell
-python main.py --context models/slot_context.pth
+The demo works without downloading CNR-EXT.
+
+```bash
+python main.py --image dataset/demo/reference.png --camera-csv dataset/demo/parking_camera.csv --blend --no-display
 ```
+
+Omit `--blend` to run the original GNN. The demo marks low-confidence
+slots as uncertain. Benchmark results instead classify every labeled slot
+with argmax.
 
 The annotated image is saved to `output/parking_detection.jpg`. To select a
 different frame, add `--image "path/to/frame.jpg" --camera-csv "path/to/camera1.csv"`
@@ -75,83 +83,56 @@ without opening a window.
 
 From the repository root, run this example on rainy Camera 1 frame:
 
-`python compare.py --image "dataset/CNR-EXT_FULL_IMAGE_1000x750/FULL_IMAGE_1000x750/RAINY/2016-01-08/camera1/2016-01-08_0919.jpg" --camera-csv "dataset/CNR-EXT_FULL_IMAGE_1000x750/camera1.csv" --labels "dataset\CNR-EXT-Patches-150x150\LABELS\train.txt"`
+`python compare.py --image "dataset/CNR-EXT_FULL_IMAGE_1000x750/FULL_IMAGE_1000x750/RAINY/2016-01-08/camera1/2016-01-08_0919.jpg" --camera-csv "dataset/CNR-EXT_FULL_IMAGE_1000x750/camera1.csv" --labels "dataset/CNR-EXT-Patches-150x150/LABELS/train.txt"`
 
 The left panel will show MobileNetV2 predictions, and the right panel will show MobileNetV2 + GNN predictions. The comparison image is saved to output/parking_comparison.jpg. Add `--no-display` to save it without opening a window. To try a different frame, pass the image path and the CSV for that frame's camera.
 
 ## Evaluate by weather
 
-The weather evaluation needs the patch archive’s **label lists** and the full
-images with their camera CSVs. It crops each parking space directly from the
-full image, so you can skip extracting `PATCHES/` for this task.
+The committed [held-out report](output/held_out_report/report_summary.md)
+contains the measured accuracy, occupied-class F1, and confusion counts for
+all three models on 896 frames (31,825 labeled parking spaces). The GNN made
+151 fewer errors than geometry-only on sunny frames, two fewer on overcast
+frames, and one more on rainy frames. These comparisons are by weather, not
+a controlled test of weather as a cause. The test cameras also appear in
+training or validation.
 
-Check the dataset paths and slot IDs before running inference:
+To reproduce the comparison locally, first place the two CNR-EXT folders
+inside `dataset/` as shown above. Keep the original date and camera
+subfolders. The full-image archive includes the nine camera CSV files.
+Only `LABELS/` is needed from the patch archive.
 
-```powershell
+```bash
+python -m pip install -r requirements.txt
 python train_context.py --check-data
+python evaluate_report.py --output output/held_out_repeat
 ```
 
-### Create the test subsets
+On Apple Silicon, pass `--encoder-device mps` to the evaluation script if
+PyTorch reports MPS is available. Use `--encoder-device cpu` to run on CPU.
 
-In PowerShell, create three subsets by copying the corresponding rows directly
-from `test.txt`. The source test list stays intact.
+## Test the score-blending improvement
 
-```powershell
-$test = "dataset\CNR-EXT-Patches-150x150\LABELS\test.txt"
-$subsetDir = "output\weather"
-$conditions = @("SUNNY", "OVERCAST", "RAINY")
-New-Item -ItemType Directory -Force $subsetDir | Out-Null
-
-foreach ($weather in $conditions) {
-    $rows = @(Get-Content -LiteralPath $test | Where-Object { $_ -match "^$weather/" })
-    if ($rows.Count -eq 0) {
-        throw "No held-out labels found for $weather in $test"
-    }
-    $subset = Join-Path $subsetDir "$weather.txt"
-    Set-Content -LiteralPath $subset -Value $rows -Encoding ascii
-    Write-Host "$weather - $($rows.Count) labeled test slots"
-}
+```bash
+python evaluate_blend.py --encoder-device cpu
 ```
 
-### Run the models
+On Apple Silicon, replace `cpu` with `mps` if available. This experiment uses
+the existing checkpoints and does not retrain. It tries GNN weights of
+0, 0.25, 0.5, 0.75, and 1 on the official validation split. A weight of 0 is
+geometry-only and 1 is the original GNN. It selects one weight using mean
+balanced accuracy on sunny and overcast validation frames. The official
+validation split has no rainy examples, so rainy performance is assessed
+only on the held-out test. The script then evaluates only the selected
+weight on the held-out test alongside the unchanged baselines. The script
+writes `output/blend_eval.csv` with the validation sweep and test results.
+Use `--output output/blend_repeat.csv` to run it again without overwriting.
 
-Run the GNN and the geometry-only checkpoint on each subset in the same PowerShell session.
-
-```powershell
-foreach ($weather in $conditions) {
-    $subset = Join-Path $subsetDir "$weather.txt"
-    Write-Host "`n$weather - GNN"
-    python train_context.py --evaluate --checkpoint models/slot_context.pth --subset $subset
-    if ($LASTEXITCODE -ne 0) { throw "GNN evaluation failed for $weather" }
-
-    Write-Host "`n$weather - geometry only"
-    python train_context.py --evaluate --checkpoint models/slot_geometry.pth --subset $subset
-    if ($LASTEXITCODE -ne 0) { throw "Geometry-only evaluation failed for $weather" }
-}
-```
-
-Each command also prints MobileNetV2 results on the same slots and crops.
-The MobileNetV2 result should agree between the two runs for each condition.
-The geometry-only checkpoint uses the space’s own visual features and
-coordinates. The GNN checkpoint also uses nearby spaces. Use the
-`train_context.py` MobileNetV2 results for this comparison. The standalone
-`evaluate.py` reads pre-cropped test images, which can produce different scores.
-
-### Report the results
-
-Fill in the number of matched frames, labeled slots, accuracy, and
-occupied-class F1 for each condition. Save the four confusion-matrix counts
-(TN, FP, FN, TP) for each model so you can see which errors changed.
-
-| Weather | Frames | Labeled slots | MobileNetV2 accuracy / F1 | Geometry-only accuracy / F1 | GNN accuracy / F1 |
-| --- | ---: | ---: | --- | --- | --- |
-| Sunny | | | | | |
-| Overcast | | | | | |
-| Rainy | | | | | |
-
-Compare the GNN with the geometry-only model within each weather condition to
-see where neighbor information helped. Report the sample counts alongside the
-scores so readers can see how much data each condition represents.
+The [completed blend report](output/blend_report/README.md) records the
+held-out result. The 50/50 blend reached **99.04% accuracy** versus
+**98.88%** for the GNN alone, with **52 fewer errors**. On rainy frames,
+false occupied calls fell from **142 to 103** while missed occupied
+spaces fell from **79 to 74**. Sunny accuracy was unchanged.
 
 ## Training and full-test evaluation
 
@@ -171,13 +152,14 @@ python train_context.py --evaluate --checkpoint models/slot_geometry.pth
 ## Generate the final evaluation report
 
 Use the official CNR-EXT patch archive for the three `LABELS` lists and
-the full-image archive for the frames and camera CSVs. Place them in the
+the full-image archive for the frames and camera CSVs. Both are available
+from the [dataset archive release](https://github.com/fabiocarrara/deep-parking/releases/tag/archive). Place them in the
 layout above. The final benchmark does not need the actual patch JPEGs.
 [Official CNRPark+EXT dataset](http://cnrpark.it/)
 
 ```bash
 python train_context.py --check-data
-python evaluate_report.py --output output/held_out_report
+python evaluate_report.py --output output/held_out_repeat
 ```
 
 The report command evaluates the same slots with the bundled MobileNetV2,
